@@ -1,10 +1,15 @@
 name: cygwin
 
 on:
- push:
-   # to be reverted, To run only for our fork main
-   branches:
-     - 'mcw/main'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run workflow on"
+        required: true
+        default: "mcw/main"
+  # push:
+  #   branches:
+  #     - 'mcw/main'
 
 jobs:
   fedora-build:
@@ -274,7 +279,11 @@ jobs:
         icacls . /grant Administrators:F
       shell: powershell
 
-    - uses: actions/checkout@v3
+    # - uses: actions/checkout@v3
+    - name: Checkout the selected branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch }}
 
     # install cygwin and build tools
     - name: Install Cygwin

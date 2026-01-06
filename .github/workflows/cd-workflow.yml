@@ -1,0 +1,179 @@
+name: cygwin-self-hosted
+
+on:
+ push:
+
+jobs:
+  windows-build:
+    runs-on: [self-hosted, Windows, ARM64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - build: x86_64-pc-cygwin
+          target: aarch64-pc-cygwin
+          buildarch: x86_64
+          pkgarch: aarch64
+          runner: cd-win-arm-11
+    name: Windows native ${{ matrix.pkgarch }}
+
+    defaults:
+      run:
+        shell: bash --noprofile --norc -eo pipefail -c "$(s=$(/usr/bin/cygpath '{0}') && /usr/bin/sed -i 's/\r$//' $s && echo $s)"
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+    # checkout action uses the native git (we can avoid this messing up line
+    # endings, but this could still be dangerous e.g if we need symlinks in the
+    # repo)
+    - name: Configure git
+      run: |
+        git config --global core.autocrlf input
+      shell: powershell
+
+    # remove inheritable permissions since they break assumptions testsuite
+    # makes about file modes
+    - name: Adjust permissions
+      run: |
+        icacls . /inheritance:r
+        icacls . /grant Administrators:F
+      shell: powershell
+
+    - uses: actions/checkout@v3
+
+    # install cygwin and build tools
+    - name: Install Cygwin
+      uses: cygwin/cygwin-install-action@master
+      with:
+        platform: ${{ matrix.buildarch }}
+        packages: >-
+          autoconf,
+          automake,
+          busybox,
+          cocom,
+          cygutils-extra,
+          dblatex,
+          dejagnu,
+          docbook-xml45,
+          docbook-xsl,
+          docbook2X,
+          gcc-g++,
+          gettext-devel,
+          libiconv,
+          libiconv-devel,
+          libzstd-devel,
+          make,
+          mingw64-${{ matrix.buildarch }}-gcc-g++,
+          mingw64-${{ matrix.buildarch }}-zlib,
+          patch,
+          perl,
+          python39-lxml,
+          python39-ply,
+          texlive-collection-fontsrecommended,
+          texlive-collection-latexrecommended,
+          texlive-collection-pictures,
+          xmlto,
+          zlib-devel
+
+    # download toolchain
+    - name: Download toolchain
+      if: ${{ matrix.pkgarch == 'aarch64' }}
+      run: |
+        export PATH=/usr/bin:$(cygpath ${SYSTEMROOT})/system32:$PATH
+        curl -L -o ${{ matrix.target }}-toolchain.tar.gz \
+          https://github.com/thiru-mcw/cygwin-own/releases/download/v2/aarch64-pc-cygwin-toolchain.tar.gz
+
+    # install toolchain
+    - name: Install toolchain
+      if: ${{ matrix.pkgarch == 'aarch64' }}
+      run: |
+        mkdir -p toolchain/${{ matrix.target }}
+        tar -xzf ${{ matrix.target }}-toolchain.tar.gz -C toolchain/${{ matrix.target }}
+
+    # build
+    - name: Build Cygwin
+      run: |
+        if [[ "${{ matrix.pkgarch }}" == "aarch64" ]]; then
+          export PATH=$(pwd)/toolchain/${{ matrix.target }}/bin:/usr/bin:$(cygpath ${SYSTEMROOT})/system32
+          export CXXFLAGS_FOR_TARGET="-D_WIN64 -I$(pwd)/toolchain/${{ matrix.target }}/include"
+          export LDFLAGS_FOR_TARGET="-L$(pwd)/toolchain/${{ matrix.target }}/lib"
+        else
+          export PATH=/usr/bin:$(cygpath ${SYSTEMROOT})/system32
+        fi
+        echo PATH=$PATH
+        export DESTDIR=$(realpath $(pwd)/install)
+        mkdir build install
+        (cd winsup; ./autogen.sh)
+        cd build
+        ../configure --prefix=/usr --build=${{ matrix.build }} --target=${{ matrix.target }} -v
+        export MAKEFLAGS=-j$(nproc)
+        make
+        export CYGWIN=winsymlinks:sys
+        make install -j1 tooldir=/usr gcc_tooldir=/usr DESTDIR=${DESTDIR}
+        (cd */newlib; make info man)
+        (cd */newlib; make install-info install-man tooldir=/usr gcc_tooldir=/usr DESTDIR=${DESTDIR})
+
+    # adjust install so it matches the physical arrangement of directories when
+    # unpacked by setup
+    - name: Rearrange for default mountpoints
+      run: |
+        mv -v install/usr/bin install/bin
+        mv -v install/usr/lib install/lib
+
+    # upload installed cygwin as an artifact, for subsequent use in
+    # test job(s)
+    - name: Make Cygwin installation artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cygwin-install-${{ matrix.pkgarch }}
+        path: |
+          install
+
+    # test
+    - name: Test Cygwin
+      run: |
+        if [[ "${{ matrix.pkgarch }}" == "aarch64" ]]; then
+          export PATH=$(pwd)/toolchain/${{ matrix.target }}/bin:/usr/bin:$(cygpath ${SYSTEMROOT})/system32
+        else
+          export PATH=/usr/bin:$(cygpath ${SYSTEMROOT})/system32
+        fi
+        export MAKEFLAGS=-j$(nproc)
+        cd build
+        (export PATH=${{ matrix.target }}/winsup/testsuite/testinst/bin:${PATH} && cmd /c $(cygpath -wa ${{ matrix.target }}/winsup/cygserver/cygserver) &)
+        (cd ${{ matrix.target }}/winsup; make check AM_COLOR_TESTS=always)
+      continue-on-error: ${{ matrix.pkgarch == 'aarch64' }}
+
+    # kill hanging processes
+    - name: Kill hanging processes
+      if: ${{ matrix.pkgarch == 'aarch64' && always() }}
+      run: |
+        taskkill /F /FI 'MODULES eq cygwin1.dll'
+        if (Test-Path -Path ${{ github.workspace }}\build\${{ matrix.target }}\winsup\testsuite\testinst\tmp) {
+          Remove-Item -Recurse -Force ${{ github.workspace }}\build\${{ matrix.target }}\winsup\testsuite\testinst\tmp
+        }
+        exit 0
+      shell: powershell
+
+    # upload test logs to facilitate investigation of problems
+    - name: Upload test logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: testlogs-${{ matrix.pkgarch }}
+        path: |
+          build/${{ matrix.target }}/winsup/testsuite/**/*.log
+          build/${{ matrix.target }}/winsup/testsuite/**/*.trs
+      if: ${{ !cancelled() }}
+
+    - name: Pack build folder
+      if: failure()
+      run: |
+        tar -cjf cygwin-${{ matrix.target }}-build.tar.bz2 build/
+
+    - name: Upload build folder
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cygwin-${{ matrix.target }}-build
+        retention-days: 5
+        path: cygwin-${{ matrix.target }}-build.tar.bz2
