@@ -814,12 +814,9 @@ format_proc_cpuinfo (void *, char *&destbuf)
       bufptr += __small_sprintf (bufptr, "BogoMIPS\t: %d.00\n", bogomips);
 
       /* Emit "cache size" line for /proc/cpuinfo feature parity with the
-         x86 branch.  Report the largest-level cache available, falling
-         back to lower levels, matching the x86 format_proc_cpuinfo logic.
-         Values come from GetLogicalProcessorInformationEx(RelationCache)
-         via get_cpu_cache_arm64() in sysconf.cc -- the same documented
-         Win32 API that sysconf(_SC_LEVEL*_CACHE_SIZE) uses, so
-         /proc/cpuinfo and sysconf() agree on ARM64.  */
+         x86 branch.Values come from
+         GetLogicalProcessorInformationEx(RelationCache)
+         via get_cpu_cache_arm64() in sysconf.cc  */
       {
         extern long get_cpu_cache_arm64 (int);
         long cs = get_cpu_cache_arm64 (_SC_LEVEL3_CACHE_SIZE);

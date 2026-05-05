@@ -493,7 +493,7 @@ get_cpu_cache_arm64 (int in)
 
   GROUP_AFFINITY cpu0_affinity = {};
   cpu0_affinity.Group = 0;
-  cpu0_affinity.Mask  = 1;   /* bit 0 = logical CPU 0 */
+  cpu0_affinity.Mask  = 1;
 
   while (remaining > 0)
     {
