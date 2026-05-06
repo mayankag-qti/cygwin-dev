@@ -18,18 +18,27 @@ cpuid (uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t ain,
 		: "=a" (*a), "=b" (*b), "=c" (*c), "=d" (*d)
 		: "a" (ain), "c" (cin));
 #elif defined(__aarch64__)
-  // TODO
+  /* AArch64 has no CPUID instruction.  Identify the target as Windows
+     ARM64 on leaf 0, and return zeros for other leaves.  */
   *a = *b = *c = *d = 0;
+  if (ain == 0)
+    {
+      *a = 0;
+      *b = 0x63724141; /* "AArc" */
+      *d = 0x57343668; /* "h64W" */
+      *c = 0x00006e69; /* "in\0\0" */
+    }
+  (void) cin;
+#else
+#error unimplemented for this target
 #endif
 }
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__)
 static inline bool __attribute ((always_inline))
 can_set_flag (uint32_t long flag)
 {
   uint32_t long r1, r2;
-
-#if defined(__x86_64__)
   asm volatile ("pushfq\n"
 		"popq %0\n"
 		"movq %0, %1\n"
@@ -43,12 +52,9 @@ can_set_flag (uint32_t long flag)
 		: "=&r" (r1), "=&r" (r2)
 		: "ir" (flag)
   );
-#elif defined(__aarch64__)
-  // TODO
-#endif
   return ((r1 ^ r2) & flag) != 0;
 }
-#else
+#elif !defined(__aarch64__)
 #error unimplemented for this target
 #endif
 
