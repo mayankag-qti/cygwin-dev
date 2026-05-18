@@ -324,7 +324,7 @@ dump_registers (HANDLE thread)
 	  context.X[24], context.X[25], context.X[26], context.X[27]);
   printf ("x28 %016llx  fp %016llx  lr %016llx\n",
 	  context.X[28], context.Fp, context.Lr);
-  printf (" sp %016llx  pc %016llx cpsr %08lx\n",
+  printf (" sp %016llx  pc %016llx cpsr %08x\n",
 	  context.Sp, context.Pc, context.Cpsr);
 #else
 #error unimplemented for this target
@@ -566,42 +566,76 @@ run_program (char *cmdline)
 		    }
 		}
 
-	      if (pc < last_pc || pc > last_pc+10)
+	      	      if (pc < last_pc || pc > last_pc+10)
 		{
 		  static int ncalls=0;
 		  static int qq=0;
+		  int is_call;
 		  if (++qq % 100 == 0)
 		    fprintf (stderr, " " CONTEXT_REG_FMT " %d %d \r",
 			    pc, ncalls, opcode_count);
 #if defined(__aarch64__)
-        /* On ARM64, BL/BLR stores return address in LR (X30),
-          not on the stack.  Detect a call by checking if LR
-          changed to point to the instruction after last_pc. */
-        if (lr != last_lr && lr == last_pc + 4)
+		  /* On ARM64, BL/BLR stores the return address in LR
+		     (X30), not on the stack.  After a BL/BLR at last_pc,
+		     LR == last_pc + 4 (BL is always 4 bytes).  This is
+		     the primary call-detection heuristic.
+
+		     However, this heuristic alone misses tail calls
+		     (B target) and indirect branches (BR Xn) that cross
+		     into kernel/system DLL space without updating LR.
+		     Without catching those, we single-step through
+		     hundreds of thousands of ntdll instructions, which
+		     on ARM64 Windows eventually exhausts the thread
+		     stack via per-step exception records and crashes
+		     the target with STATUS_STACK_OVERFLOW (0xc00000fd).
+
+		     So we *also* treat any transition from user-space
+		     into kernel/system DLL address space as a call for
+		     the purpose of planting the kernel-skip breakpoint.  */
+		  is_call = (lr != last_lr && lr == last_pc + 4);
 #else
-		    if (sp == last_sp-sizeof(CONTEXT_REG))
+		  is_call = (sp == last_sp-sizeof(CONTEXT_REG));
 #endif
-          {
-            ncalls++;
-            store_call_edge (last_pc, pc);
-            if (last_pc < KERNEL_ADDR && pc > KERNEL_ADDR)
-              {
-#if 0
-                CONTEXT_REG retaddr;
-                SIZE_T rv;
-                ReadProcessMemory (hProcess,
-                      (void *)sp,
-                      (LPVOID)&(retaddr),
-                      sizeof(retaddr), &rv);
-                printf ("call last_pc = " CONTEXT_REG_FMT " pc = " CONTEXT_REG_FMT " rv = " CONTEXT_REG_FMT "\n",
-                last_pc, pc, retaddr);
-                /* experimental - try to skip kernel calls for speed */
-                add_breakpoint (retaddr);
-                set_step_threads (event.dwThreadId, 0);
+		  if (is_call)
+		    {
+		      ncalls++;
+		      store_call_edge (last_pc, pc);
+		    }
+		  if (last_pc && last_pc < KERNEL_ADDR && pc > KERNEL_ADDR)
+		    {
+#if defined(__aarch64__)
+		      /* On ARM64, the return address for a BL/BLR is in
+			 LR.  For a tail-call (B/BR) it isn't, but LR will
+			 still hold the return address of whatever frame
+			 made the original call into our code, so it's the
+			 correct place to break to resume stepping.  Place
+			 a breakpoint there and stop single-stepping until
+			 we return from the kernel/DLL call. */
+		      CONTEXT_REG retaddr = lr;
+		      if (verbose)
+			printf ("skip kernel call: " CONTEXT_REG_FMT " -> " CONTEXT_REG_FMT ", ret = " CONTEXT_REG_FMT "\n",
+				last_pc, pc, retaddr);
+		      if (retaddr && retaddr < KERNEL_ADDR)
+			{
+			  add_breakpoint (retaddr);
+			  set_step_threads (event.dwThreadId, 0);
+			}
+#else
+		      CONTEXT_REG retaddr;
+		      SIZE_T bytes_read;
+		      ReadProcessMemory (hProcess,
+					 (void *)sp,
+					 (LPVOID)&(retaddr),
+					 sizeof(retaddr), &bytes_read);
+		      if (verbose)
+			printf ("skip kernel call: " CONTEXT_REG_FMT " -> " CONTEXT_REG_FMT ", ret = " CONTEXT_REG_FMT "\n",
+				last_pc, pc, retaddr);
+		      /* experimental - try to skip kernel calls for speed */
+		      add_breakpoint (retaddr);
+		      set_step_threads (event.dwThreadId, 0);
 #endif
-              }
-          }
-		  }
+		    }
+		}
 
 	      total_cycles++;
 	      last_sp = sp;
@@ -623,7 +657,8 @@ run_program (char *cmdline)
 		    dump_registers (hThread);
 		}
 	      contv = DBG_EXCEPTION_NOT_HANDLED;
-	      running = 0;
+	      if (!event.u.Exception.dwFirstChance)
+		  running = 0;
 	      break;
 	    }
 
