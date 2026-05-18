@@ -566,7 +566,7 @@ run_program (char *cmdline)
 		    }
 		}
 
-	      	      if (pc < last_pc || pc > last_pc+10)
+	  if (pc < last_pc || pc > last_pc+10)
 		{
 		  static int ncalls=0;
 		  static int qq=0;
@@ -598,7 +598,7 @@ run_program (char *cmdline)
 #endif
 		  if (is_call)
 		    {
-		      ncalls++;
+		      		      ncalls++;
 		      store_call_edge (last_pc, pc);
 		    }
 		  if (last_pc && last_pc < KERNEL_ADDR && pc > KERNEL_ADDR)
@@ -1060,10 +1060,28 @@ main (int argc, char **argv)
     }
   memset (hits, 0, range+4);
 
-  fprintf (stderr, "prun: [" CONTEXT_REG_FMT "," CONTEXT_REG_FMT "] Running '%s'\n",
+    fprintf (stderr, "prun: [" CONTEXT_REG_FMT "," CONTEXT_REG_FMT "] Running '%s'\n",
 	  low_pc, high_pc, argv[optind]);
 
-  run_program (argv[optind]);
+    /* CreateProcess (when called with lpApplicationName == NULL, as we do)
+     is documented to modify lpCommandLine in place.  argv[optind] points
+     into the original argv buffer; passing it directly causes corruption
+     observable as e.g. 'test_hello.exe' becoming 'st_hello.exxee' on
+     subsequent uses.  Hand it a private writable copy instead.
+
+     The buffer is intentionally not freed: run_program() stashes its
+     address in dll_info[0].name, which is later read by the DLL table
+     printout in main() below.  Letting it leak until process exit is
+     simpler and safer than tracking another lifetime.  */
+  {
+    char *cmdline_copy = strdup (argv[optind]);
+    if (!cmdline_copy)
+      {
+	fprintf (stderr, "Out of memory duplicating cmdline\n");
+	exit (1);
+      }
+    run_program (cmdline_copy);
+  }
 
   hdr.lpc = low_pc;
   hdr.hpc = high_pc;
