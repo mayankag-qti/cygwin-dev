@@ -1973,8 +1973,17 @@ _cygtls::call_signal_handler ()
 		       [CTX]	 "r" (thiscontext),
 		       [FUNC]	 "r" (thisfunc),
 		       [WRAPPER] "r" (altstack_wrapper)
-		   : "memory", "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-		     "x9", "x10", "x29", "x30");
+		   /* altstack_wrapper is an ordinary C call, so every
+		      caller-saved register may be clobbered.  x18 (the Windows
+		      TEB pointer) and v8-v15 (callee-saved on Windows) are
+		      preserved and thus omitted.  */
+		   : "memory", "cc",
+		     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+		     "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+		     "x16", "x17", "x29", "x30",
+		     "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+		     "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+		     "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 #else
 #error unimplemented for this target
 #endif
@@ -2054,10 +2063,76 @@ setcontext (const ucontext_t *ucp)
 {
   PCONTEXT ctx = (PCONTEXT) &ucp->uc_mcontext;
   set_signal_mask (_my_tls.sigmask, ucp->uc_sigmask);
+#if defined(__aarch64__)
+  /* On ARM64, RtlRestoreContext raises STATUS_ILLEGAL_INSTRUCTION when asked
+     to restore a synthetic context built by makecontext rather than one
+     captured by RtlCaptureContext/GetThreadContext: it rejects an arbitrary
+     PC and a stack outside the thread's registered range.  Restore the
+     registers by hand and branch to the saved PC instead, as glibc/musl do
+     for aarch64.  x16/x17 are IP0/IP1 scratch, so we use them as the base
+     and branch target and leave their context values unrestored.  */
+  register PCONTEXT base __asm__ ("x16") = ctx;
+  __asm__ __volatile__ ("\n\
+	/* Restore NEON/FP registers v0..v31 (at offset 272) */	\n\
+	add	x17, x16, #272					\n\
+	ldp	q0, q1, [x17, #0]				\n\
+	ldp	q2, q3, [x17, #32]				\n\
+	ldp	q4, q5, [x17, #64]				\n\
+	ldp	q6, q7, [x17, #96]				\n\
+	ldp	q8, q9, [x17, #128]				\n\
+	ldp	q10, q11, [x17, #160]				\n\
+	ldp	q12, q13, [x17, #192]				\n\
+	ldp	q14, q15, [x17, #224]				\n\
+	ldp	q16, q17, [x17, #256]				\n\
+	ldp	q18, q19, [x17, #288]				\n\
+	ldp	q20, q21, [x17, #320]				\n\
+	ldp	q22, q23, [x17, #352]				\n\
+	ldp	q24, q25, [x17, #384]				\n\
+	ldp	q26, q27, [x17, #416]				\n\
+	ldp	q28, q29, [x17, #448]				\n\
+	ldp	q30, q31, [x17, #480]				\n\
+	/* Restore FPCR and FPSR */				\n\
+	ldr	w17, [x16, #784]				\n\
+	msr	fpcr, x17					\n\
+	ldr	w17, [x16, #788]				\n\
+	msr	fpsr, x17					\n\
+	/* Load PC into x17 (branch target, offset 264) */	\n\
+	ldr	x17, [x16, #264]				\n\
+	/* Restore callee-saved GPRs x18..x28, fp, lr */	\n\
+	ldp	x18, x19, [x16, #152]				\n\
+	ldp	x20, x21, [x16, #168]				\n\
+	ldp	x22, x23, [x16, #184]				\n\
+	ldp	x24, x25, [x16, #200]				\n\
+	ldp	x26, x27, [x16, #216]				\n\
+	ldp	x28, x29, [x16, #232]				\n\
+	ldr	x30, [x16, #248]				\n\
+	/* Restore caller-saved GPRs x2..x15 */			\n\
+	ldp	x2, x3, [x16, #24]				\n\
+	ldp	x4, x5, [x16, #40]				\n\
+	ldp	x6, x7, [x16, #56]				\n\
+	ldp	x8, x9, [x16, #72]				\n\
+	ldp	x10, x11, [x16, #88]				\n\
+	ldp	x12, x13, [x16, #104]				\n\
+	ldp	x14, x15, [x16, #120]				\n\
+	/* Restore x0, x1 */					\n\
+	ldp	x0, x1, [x16, #8]				\n\
+	/* Set SP from context (last use of x16 as base) */	\n\
+	ldr	x16, [x16, #256]				\n\
+	mov	sp, x16						\n\
+	/* Branch to saved PC */				\n\
+	br	x17						\n\
+"
+	: /* no outputs (noreturn) */
+	: "r" (base)
+	: "memory"
+  );
+  __builtin_unreachable ();
+#else
   RtlRestoreContext (ctx, NULL);
   /* If we got here, something was wrong. */
   set_errno (EINVAL);
   return -1;
+#endif
 }
 
 extern "C" int
@@ -2116,22 +2191,23 @@ __cont_link_context:			\n\
 	.seh_endproc			\n\
 	");
 #elif defined(__aarch64__)
+/* _MC_uclinkReg == x19.  x19 holds the address of the uc_link slot but is
+   only 8-byte aligned, so read through it and mask into SP in one step
+   rather than moving the unaligned value into SP first.  setcontext and
+   cygwin_exit are noreturn, so tail-call them with 'b': this leaves x30
+   untouched and keeps the frame leaf, matching the empty SEH prologue. */
 __asm__ ("					\n\
 	.global	__cont_link_context		\n\
 	.seh_proc __cont_link_context		\n\
 __cont_link_context:				\n\
 	.seh_endprologue			\n\
-	mov	sp, x19				\n\
-	ldr	x0, [sp]			\n\
-	mov	x4, sp				\n\
-	and	x4, x4, #0xfffffffffffffff0	\n\
-	mov	sp, x4				\n\
-	cbz	x0, 1f				\n\
-	bl	setcontext			\n\
-	mov	w0, #0xff			\n\
+	ldr	x0, [x19]			// x0 = uc_link		\n\
+	and	sp, x19, #~0xf			// aligned SP = &uc_link	\n\
+	cbnz	x0, 1f				// uc_link set: resume	\n\
+	mov	w0, #0xff			// else exit (0xff)	\n\
+	b	cygwin_exit			\n\
 1:						\n\
-	bl	cygwin_exit			\n\
-	nop					\n\
+	b	setcontext			\n\
 	.seh_endproc				\n"
 	);
 #else
