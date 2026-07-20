@@ -1973,10 +1973,16 @@ _cygtls::call_signal_handler ()
 		       [CTX]	 "r" (thiscontext),
 		       [FUNC]	 "r" (thisfunc),
 		       [WRAPPER] "r" (altstack_wrapper)
-		   /* altstack_wrapper is an ordinary C call, so every
-		      caller-saved register may be clobbered.  x18 (the Windows
-		      TEB pointer) and v8-v15 (callee-saved on Windows) are
-		      preserved and thus omitted.  */
+		   /* The clobber list serves two roles here.  x0-x7, x9, x10
+		      and x29 are hardcoded by this asm as scratch/argument
+		      registers, so they are listed to stop gcc allocating the
+		      "r" inputs into them.  (The x86_64 path above needs no
+		      such guard because its inputs are "o" memory operands.)
+		      The remaining registers - x8, x11-x17, x30 (trampled by
+		      the blr) and v0-v7/v16-v31 - are caller-saved and clobbered
+		      by the ordinary C call to altstack_wrapper.  x18 (the
+		      Windows TEB pointer) and v8-v15 (callee-saved on Windows)
+		      survive the call and are omitted.  */
 		   : "memory", "cc",
 		     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
 		     "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
@@ -2069,8 +2075,22 @@ setcontext (const ucontext_t *ucp)
      captured by RtlCaptureContext/GetThreadContext: it rejects an arbitrary
      PC and a stack outside the thread's registered range.  Restore the
      registers by hand and branch to the saved PC instead, as glibc/musl do
-     for aarch64.  x16/x17 are IP0/IP1 scratch, so we use them as the base
-     and branch target and leave their context values unrestored.  */
+     for aarch64.
+
+     The numeric offsets below are byte offsets into struct __mcontext, whose
+     layout mirrors the Windows ARM64 CONTEXT: x0/x1 @8, x2-x15 @24-120,
+     x18-x28/fp @152-232, lr @248, sp @256, pc @264, v[0..31] @272 (16 bytes
+     each), fpcr @784, fpsr @788.
+
+     x16 (IP0) and x17 (IP1) are the ABI intra-procedure-call scratch
+     registers: their values in the context are deliberately not restored.
+     We reuse x16 as the base pointer and x17 as the branch target, and the
+     ABI permits the linker to clobber x16/x17 in any call/branch veneer, so a
+     ucontext consumer may not rely on them surviving a setcontext.  CPSR is
+     likewise not restored: it cannot be written from EL0 with a plain msr,
+     the only flags of interest (NZCV) are caller-clobbered across the
+     makecontext/swapcontext boundary this path serves, and glibc/musl take
+     the same approach for aarch64.  */
   register PCONTEXT base __asm__ ("x16") = ctx;
   __asm__ __volatile__ ("\n\
 	/* Restore NEON/FP registers v0..v31 (at offset 272) */	\n\
@@ -2216,8 +2236,12 @@ __cont_link_context:				\n\
 
 /* makecontext is modelled after GLibc's makecontext.  The stack from uc_stack
    is prepared so that it starts with a pointer to the linked context uc_link,
-   followed by the arguments to func, and finally at the bottom the "return"
-   address set to __cont_link_context.
+   followed by the arguments to func.
+
+   The trampoline __cont_link_context is reached differently per target: on
+   x86_64 its address is written at the bottom of the stack as the "return"
+   address, whereas on aarch64 it is placed in lr (see below), since the
+   AArch64 ABI returns through the link register rather than the stack.
 
    x86_64: In the ucp context, rbx is set to point to the stack address where
    the pointer to uc_link is stored.  The requirement to make this work is that
@@ -2271,6 +2295,8 @@ makecontext (ucontext_t *ucp, void (*func) (void), int argc, ...)
   /* ARM64 requires 16-byte alignment at public interfaces. */
   sp = (uintptr_t *) ((uintptr_t) sp & ~0xfUL);
 
+#else
+#error unimplemented for this target
 #endif
 
   /* Fetch arguments and store them.
@@ -2346,6 +2372,8 @@ makecontext (ucontext_t *ucp, void (*func) (void), int argc, ...)
           sp[i - 8] = va_arg (ap, uintptr_t);
           break;
         }
+#else
+#error unimplemented for this target
 #endif
     }
   va_end (ap);
@@ -2359,6 +2387,8 @@ makecontext (ucontext_t *ucp, void (*func) (void), int argc, ...)
   /* Store pointer to uc_link at the top of our allocated area. */
   sp[stack_args] = (uintptr_t) ucp->uc_link;
 
+#else
+#error unimplemented for this target
 #endif
 
   /* Last but not least set the register in the context at ucp so that a
@@ -2382,5 +2412,7 @@ makecontext (ucontext_t *ucp, void (*func) (void), int argc, ...)
   ucp->uc_mcontext.lr = (uint64_t) __cont_link_context;
   ucp->uc_mcontext._MC_uclinkReg = (uint64_t) (sp + stack_args);
 
+#else
+#error unimplemented for this target
 #endif
 }
